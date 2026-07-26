@@ -14,6 +14,7 @@ build-static/
 build-no-accel/
 build-sanitize-addr/
 build-sanitize-thread/
+build_lto/
 
 models/*
 

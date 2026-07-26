@@ -71,6 +71,20 @@ class RWKVModel:
         self._valid: bool = True
 
     @property
+    def supports_tensor_upload(self) -> bool:
+        return bool(getattr(self._library, "supports_tensor_upload", False))
+
+    @property
+    def supports_tensor_slot_upload(self) -> bool:
+        return bool(getattr(self._library, "supports_tensor_slot_upload", False))
+
+    def register_tensor_slot(self, slot_id: int, buffer: bytearray) -> None:
+        self._library.rwkv_register_tensor_slot(self._ctx, slot_id, buffer)
+
+    def set_tensor_from_slot(self, name: str, slot_id: int, offset: int, length: int, generation: int) -> None:
+        self._library.rwkv_set_tensor_from_slot(self._ctx, name, slot_id, offset, length, generation)
+
+    @property
     def n_vocab(self) -> int:
         return self._library.rwkv_get_n_vocab(self._ctx)
 
@@ -81,6 +95,24 @@ class RWKVModel:
     @property
     def n_layer(self) -> int:
         return self._library.rwkv_get_n_layer(self._ctx)
+
+    def tensor_nbytes(self, name: str) -> int:
+        """Return the native byte size of a loaded tensor, or 0 if absent."""
+        if not self._valid:
+            raise ValueError('Model was freed')
+        return self._library.rwkv_get_tensor_nbytes(self._ctx, name)
+
+    def set_tensor(self, name: str, data: bytes) -> None:
+        """Replace one tensor in the loaded ggml model."""
+        if not self._valid:
+            raise ValueError('Model was freed')
+        self._library.rwkv_set_tensor(self._ctx, name, data)
+
+    def set_tensor_from_pointer(self, name: str, address: int, nbytes: int) -> None:
+        """Replace one tensor from a live contiguous native CPU buffer."""
+        if not self._valid:
+            raise ValueError('Model was freed')
+        self._library.rwkv_set_tensor_from_pointer(self._ctx, name, address, nbytes)
 
     def eval(
             self,

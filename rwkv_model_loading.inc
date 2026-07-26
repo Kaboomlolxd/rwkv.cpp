@@ -102,6 +102,20 @@ struct rwkv_model {
 
     struct ggml_tensor * head;
 
+    // Non-owning lookup table retained after load.  The public streaming
+    // bridge uses this to refresh a layer from the SSD provider without
+    // rebuilding the ggml graph or reloading the model file.
+    std::unordered_map<std::string, struct ggml_tensor *> tensors;
+
+    struct tensor_slot {
+        const uint8_t * data;
+        size_t nbytes;
+        uint64_t generation;
+    };
+    // Non-owning host buffers registered by the streaming caller. The caller
+    // must keep each buffer alive until the model is freed or re-registered.
+    std::unordered_map<uint32_t, tensor_slot> tensor_slots;
+
     // How many layers were offloaded to the GPU.
     // Model head is counted as an additional layer,
     // so the max value for this field is n_layers + 1.
@@ -399,6 +413,11 @@ static bool rwkv_load_model_from_file(const char * file_path, struct rwkv_model 
             rwkv_fread_ggml_tensor_data(file.file, parameters_ref),
             "Failed to read a model parameter");
     }
+
+    // Keep the tensor-name map alive for the runtime upload API.  Tensor
+    // storage is owned by model.ggml_ctx/backend buffers; this map only holds
+    // non-owning pointers and is cleared with the model.
+    model.tensors = parameters;
 
     if (model.arch_version_major == 7) {
         model.head_count = model.layers[0].att_r_k->ne[1];

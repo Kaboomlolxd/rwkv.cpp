@@ -215,6 +215,87 @@ void rwkv_free(struct rwkv_context * ctx) {
 }
 
 // API function.
+bool rwkv_set_tensor(
+    struct rwkv_context * ctx,
+    const char * name,
+    const void * data,
+    const size_t nbytes
+) {
+    RWKV_ASSERT_FALSE_MSG(RWKV_ERROR_ARGS, ctx != nullptr, "Context is null");
+    RWKV_ASSERT_FALSE_MSG(RWKV_ERROR_ARGS, name != nullptr, "Tensor name is null");
+    RWKV_ASSERT_FALSE_MSG(RWKV_ERROR_ARGS, data != nullptr, "Tensor data is null");
+
+    auto it = ctx->model->tensors.find(name);
+    RWKV_ASSERT_FALSE_MSG(RWKV_ERROR_KEY, it != ctx->model->tensors.end(), "Unknown tensor %s", name);
+    struct ggml_tensor * tensor = it->second;
+    const size_t expected = ggml_nbytes(tensor);
+    RWKV_ASSERT_FALSE_MSG(
+        RWKV_ERROR_DATA,
+        nbytes == expected,
+        "Invalid byte count for tensor %s (%llu, expected %llu)",
+        name,
+        static_cast<unsigned long long>(nbytes),
+        static_cast<unsigned long long>(expected)
+    );
+    ggml_backend_tensor_set(tensor, data, 0, nbytes);
+    return true;
+}
+
+// API function.
+size_t rwkv_get_tensor_nbytes(
+    const struct rwkv_context * ctx,
+    const char * name
+) {
+    if (ctx == nullptr || name == nullptr) {
+        return 0;
+    }
+    auto it = ctx->model->tensors.find(name);
+    if (it == ctx->model->tensors.end()) {
+        return 0;
+    }
+    return ggml_nbytes(it->second);
+}
+
+bool rwkv_register_tensor_slot(
+    struct rwkv_context * ctx,
+    const uint32_t slot_id,
+    const void * data,
+    const size_t nbytes
+) {
+    RWKV_ASSERT_FALSE_MSG(RWKV_ERROR_ARGS, ctx != nullptr, "Context is null");
+    RWKV_ASSERT_FALSE_MSG(RWKV_ERROR_ARGS, data != nullptr, "Slot data is null");
+    RWKV_ASSERT_FALSE_MSG(RWKV_ERROR_ARGS, nbytes > 0, "Slot is empty");
+    ctx->model->tensor_slots[slot_id] = {
+        static_cast<const uint8_t *>(data), nbytes, 0
+    };
+    return true;
+}
+
+bool rwkv_set_tensor_from_slot(
+    struct rwkv_context * ctx,
+    const char * name,
+    const uint32_t slot_id,
+    const size_t offset,
+    const size_t nbytes,
+    const uint64_t generation
+) {
+    RWKV_ASSERT_FALSE_MSG(RWKV_ERROR_ARGS, ctx != nullptr, "Context is null");
+    RWKV_ASSERT_FALSE_MSG(RWKV_ERROR_ARGS, name != nullptr, "Tensor name is null");
+    auto slot_it = ctx->model->tensor_slots.find(slot_id);
+    RWKV_ASSERT_FALSE_MSG(RWKV_ERROR_KEY, slot_it != ctx->model->tensor_slots.end(), "Unknown tensor slot");
+    auto & slot = slot_it->second;
+    RWKV_ASSERT_FALSE_MSG(RWKV_ERROR_DATA, generation >= slot.generation, "Stale tensor slot generation");
+    RWKV_ASSERT_FALSE_MSG(RWKV_ERROR_DATA, offset <= slot.nbytes && nbytes <= slot.nbytes - offset, "Tensor slot range is invalid");
+    auto tensor_it = ctx->model->tensors.find(name);
+    RWKV_ASSERT_FALSE_MSG(RWKV_ERROR_KEY, tensor_it != ctx->model->tensors.end(), "Unknown tensor %s", name);
+    struct ggml_tensor * tensor = tensor_it->second;
+    RWKV_ASSERT_FALSE_MSG(RWKV_ERROR_DATA, ggml_nbytes(tensor) == nbytes, "Tensor slot byte count mismatch");
+    ggml_backend_tensor_set(tensor, slot.data + offset, 0, nbytes);
+    slot.generation = generation;
+    return true;
+}
+
+// API function.
 void rwkv_set_print_errors(struct rwkv_context * ctx, const bool print_errors) {
     bool * ptr = ctx ? &ctx->print_errors : &global_print_errors;
     *ptr = print_errors;

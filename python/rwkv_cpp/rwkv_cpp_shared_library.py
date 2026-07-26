@@ -97,6 +97,33 @@ class RWKVSharedLibrary:
         self.library.rwkv_free.argtypes = [ctypes.c_void_p]
         self.library.rwkv_free.restype = None
 
+        self.supports_tensor_upload = all(
+            hasattr(self.library, name)
+            for name in ("rwkv_set_tensor", "rwkv_get_tensor_nbytes")
+        )
+        if self.supports_tensor_upload:
+            self.library.rwkv_set_tensor.argtypes = [
+                ctypes.c_void_p,
+                ctypes.c_char_p,
+                ctypes.c_void_p,
+                ctypes.c_size_t,
+            ]
+            self.library.rwkv_set_tensor.restype = ctypes.c_bool
+
+            self.library.rwkv_get_tensor_nbytes.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
+            self.library.rwkv_get_tensor_nbytes.restype = ctypes.c_size_t
+
+        self.supports_tensor_slot_upload = all(
+            hasattr(self.library, name)
+            for name in ("rwkv_register_tensor_slot", "rwkv_set_tensor_from_slot")
+        )
+        self._tensor_slot_buffers = {}
+        if self.supports_tensor_slot_upload:
+            self.library.rwkv_register_tensor_slot.argtypes = [ctypes.c_void_p, ctypes.c_uint32, ctypes.c_void_p, ctypes.c_size_t]
+            self.library.rwkv_register_tensor_slot.restype = ctypes.c_bool
+            self.library.rwkv_set_tensor_from_slot.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_uint32, ctypes.c_size_t, ctypes.c_size_t, ctypes.c_uint64]
+            self.library.rwkv_set_tensor_from_slot.restype = ctypes.c_bool
+
         self.library.rwkv_free.argtypes = [ctypes.c_void_p]
         self.library.rwkv_free.restype = None
 
@@ -163,6 +190,65 @@ class RWKVSharedLibrary:
             ctypes.cast(logits_out_address, P_FLOAT)
         ):
             raise ValueError('rwkv_eval failed, check stderr')
+
+    def rwkv_set_tensor(self, ctx: RWKVContext, name: str, data: bytes) -> None:
+        """Replace one loaded tensor using its exact ggml-native bytes."""
+        if not self.supports_tensor_upload:
+            raise NotImplementedError(
+                "rwkv.cpp library lacks the SSD tensor-upload ABI; rebuild the "
+                "vendored backend"
+            )
+        payload = ctypes.create_string_buffer(data)
+        ok = self.library.rwkv_set_tensor(
+            ctx.ptr,
+            name.encode('utf-8'),
+            ctypes.cast(payload, ctypes.c_void_p),
+            ctypes.c_size_t(len(data)),
+        )
+        if not ok:
+            raise ValueError(f'rwkv_set_tensor failed for {name!r}, check stderr')
+
+    def rwkv_set_tensor_from_pointer(
+        self, ctx: RWKVContext, name: str, address: int, nbytes: int
+    ) -> None:
+        """Replace a tensor directly from an already-contiguous native buffer.
+
+        The legacy ``rwkv_set_tensor`` wrapper accepts ``bytes`` and therefore
+        allocates a second temporary ctypes buffer before ggml copies the
+        tensor.  Streaming callers already own a correctly typed CPU tensor;
+        passing its address removes that intermediate Python-side copy while
+        retaining the same synchronous C ABI and lifetime requirements.
+        """
+        if not self.supports_tensor_upload:
+            raise NotImplementedError(
+                "rwkv.cpp library lacks the SSD tensor-upload ABI; rebuild the "
+                "vendored backend"
+            )
+        if int(address) <= 0 or int(nbytes) <= 0:
+            raise ValueError("tensor pointer and byte count must be positive")
+        ok = self.library.rwkv_set_tensor(
+            ctx.ptr,
+            name.encode('utf-8'),
+            ctypes.c_void_p(int(address)),
+            ctypes.c_size_t(int(nbytes)),
+        )
+        if not ok:
+            raise ValueError(f'rwkv_set_tensor failed for {name!r}, check stderr')
+
+    def rwkv_get_tensor_nbytes(self, ctx: RWKVContext, name: str) -> int:
+        if not self.supports_tensor_upload:
+            return 0
+        return int(self.library.rwkv_get_tensor_nbytes(ctx.ptr, name.encode('utf-8')))
+
+    def rwkv_register_tensor_slot(self, ctx: RWKVContext, slot_id: int, buffer: bytearray) -> None:
+        view = (ctypes.c_ubyte * len(buffer)).from_buffer(buffer)
+        if not self.library.rwkv_register_tensor_slot(ctx.ptr, slot_id, ctypes.cast(view, ctypes.c_void_p), len(buffer)):
+            raise ValueError('rwkv_register_tensor_slot failed')
+        self._tensor_slot_buffers[(int(ctx.ptr), slot_id)] = view
+
+    def rwkv_set_tensor_from_slot(self, ctx: RWKVContext, name: str, slot_id: int, offset: int, length: int, generation: int) -> None:
+        if not self.library.rwkv_set_tensor_from_slot(ctx.ptr, name.encode('utf-8'), slot_id, offset, length, generation):
+            raise ValueError(f'rwkv_set_tensor_from_slot failed for {name!r}')
 
     def rwkv_eval_sequence(
             self,
@@ -378,14 +464,20 @@ def load_rwkv_shared_library() -> RWKVSharedLibrary:
     To specify exact path to the library, create an instance of RWKVSharedLibrary explicitly.
     """
 
-    file_name: str
+    # Keep the convenience loader aligned with the engine backend.  Windows
+    # builds made by MinGW commonly emit ``librwkv.dll`` while the upstream
+    # helper historically searched only for ``rwkv.dll``.  An explicit path
+    # is also useful for side-by-side optimized builds and deployment.
+    explicit = os.environ.get('RWKVCPP_DLL', '').strip()
+    if explicit and os.path.isfile(explicit):
+        return RWKVSharedLibrary(explicit)
 
     if 'win32' in sys.platform or 'cygwin' in sys.platform:
-        file_name = 'rwkv.dll'
+        file_names = ('rwkv.dll', 'librwkv.dll')
     elif 'darwin' in sys.platform:
-        file_name = 'librwkv.dylib'
+        file_names = ('librwkv.dylib',)
     else:
-        file_name = 'librwkv.so'
+        file_names = ('librwkv.so',)
 
     # Possible sub-paths to the library relative to the repo dir.
     child_paths: List[Callable[[pathlib.Path], pathlib.Path]] = [
@@ -417,11 +509,12 @@ def load_rwkv_shared_library() -> RWKVSharedLibrary:
     ]
 
     for parent_path in parent_paths:
-        for child_path in child_paths:
-            full_path: pathlib.Path = child_path(parent_path)
+        for file_name in file_names:
+            for child_path in child_paths:
+                full_path: pathlib.Path = child_path(parent_path)
 
-            if os.path.isfile(full_path):
-                return RWKVSharedLibrary(str(full_path))
+                if os.path.isfile(full_path):
+                    return RWKVSharedLibrary(str(full_path))
 
-    raise ValueError(f'Failed to find {file_name} automatically; '
+    raise ValueError(f'Failed to find {file_names[0]} automatically; '
                      f'you need to find the library and create RWKVSharedLibrary specifying the path to it')

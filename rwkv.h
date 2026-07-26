@@ -204,6 +204,41 @@ extern "C" {
     // Does not need to be called on the same thread that created the rwkv_context.
     RWKV_API void rwkv_free(struct rwkv_context * ctx);
 
+    // Upload a tensor into an already loaded model.  This is intentionally a
+    // small ABI surface for SSD streaming: the tensor must have the exact
+    // ggml-native byte representation and size used by the loaded .bin file.
+    // Returns false when the name is unknown or the byte count is invalid.
+    RWKV_API bool rwkv_set_tensor(
+        struct rwkv_context * ctx,
+        const char * name,
+        const void * data,
+        const size_t nbytes
+    );
+
+    // Returns the exact ggml-native byte size for a named tensor, or 0 when
+    // the name is not present.  Used by the Python bridge to select FP16/F32
+    // upload buffers without depending on private ggml structs.
+    RWKV_API size_t rwkv_get_tensor_nbytes(
+        const struct rwkv_context * ctx,
+        const char * name
+    );
+
+    RWKV_API bool rwkv_register_tensor_slot(
+        struct rwkv_context * ctx,
+        const uint32_t slot_id,
+        const void * data,
+        const size_t nbytes
+    );
+
+    RWKV_API bool rwkv_set_tensor_from_slot(
+        struct rwkv_context * ctx,
+        const char * name,
+        const uint32_t slot_id,
+        const size_t offset,
+        const size_t nbytes,
+        const uint64_t generation
+    );
+
     // Quantizes FP32 or FP16 model to one of quantized formats.
     // Returns false on any error. Error messages would be printed to stderr.
     // - model_file_path_in: path to model file in ggml format, must be either FP32 or FP16.
