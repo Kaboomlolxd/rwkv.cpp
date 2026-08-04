@@ -3,6 +3,7 @@ import sys
 import ctypes
 import pathlib
 import platform
+import numpy as np
 from typing import Optional, List, Tuple, Callable
 
 QUANTIZED_FORMAT_NAMES: Tuple[str, str, str, str, str] = (
@@ -17,6 +18,54 @@ QUANTIZED_FORMAT_NAMES: Tuple[str, str, str, str, str] = (
 
 P_FLOAT = ctypes.POINTER(ctypes.c_float)
 P_INT = ctypes.POINTER(ctypes.c_int32)
+
+
+def _native_buffer_pointer(
+    data: bytes | bytearray | memoryview,
+) -> tuple[ctypes.c_void_p, object, int]:
+    """Return a borrowed pointer without copying writable upload buffers.
+
+    Layer uploads are synchronous in the C ABI, so the returned holder only
+    needs to stay alive for the duration of the call.  Read-only or
+    non-contiguous views are materialized once; bytearrays and contiguous
+    writable mmap views are passed directly to ggml.
+    """
+    if isinstance(data, memoryview):
+        if not data.contiguous or data.format not in {"B", "b", "c"}:
+            data = data.tobytes()
+        else:
+            view = data.cast("B") if data.format != "B" else data
+            # ``ctypes.from_buffer`` rejects a read-only mmap view.  NumPy
+            # still exposes its address without copying, and the retained
+            # view/array pair keeps the mmap owner alive through the
+            # synchronous native call (or the model's borrowed lifetime).
+            try:
+                array = np.frombuffer(view, dtype=np.uint8)
+                return (
+                    ctypes.c_void_p(int(array.ctypes.data)),
+                    (view, array),
+                    view.nbytes,
+                )
+            except (TypeError, ValueError):
+                pass
+        if not data.readonly:
+            view = data.cast("B") if data.format != "B" else data
+            holder = (ctypes.c_ubyte * view.nbytes).from_buffer(view)
+            return ctypes.cast(holder, ctypes.c_void_p), holder, view.nbytes
+        else:
+            # A read-only slice may start at a non-zero offset inside a bytes
+            # object; materialize the exact slice rather than passing the
+            # base object's address.
+            data = data.tobytes()
+    if isinstance(data, bytearray):
+        holder = (ctypes.c_ubyte * len(data)).from_buffer(data)
+        return ctypes.cast(holder, ctypes.c_void_p), holder, len(data)
+    if isinstance(data, bytes):
+        holder = ctypes.c_char_p(data)
+        return ctypes.cast(holder, ctypes.c_void_p), holder, len(data)
+    payload = bytes(data)
+    holder = ctypes.c_char_p(payload)
+    return ctypes.cast(holder, ctypes.c_void_p), holder, len(payload)
 
 class RWKVContext:
 
@@ -48,6 +97,213 @@ class RWKVSharedLibrary:
 
         self.library.rwkv_init_from_file.argtypes = [ctypes.c_char_p, ctypes.c_uint32, ctypes.c_uint32]
         self.library.rwkv_init_from_file.restype = ctypes.c_void_p
+
+        self.supports_native_u8_init = hasattr(self.library, "rwkv_init_from_file_ex")
+        if self.supports_native_u8_init:
+            self.library.rwkv_init_from_file_ex.argtypes = [
+                ctypes.c_char_p,
+                ctypes.c_uint32,
+                ctypes.c_uint32,
+                ctypes.c_uint32,
+            ]
+            self.library.rwkv_init_from_file_ex.restype = ctypes.c_void_p
+
+        self.supports_layer_streaming = all(
+            hasattr(self.library, name)
+            for name in (
+                "rwkv_supports_layer_streaming",
+                "rwkv_get_layer_state_len",
+                "rwkv_layer_begin",
+                "rwkv_layer_set_tensor",
+                "rwkv_layer_set_tensor_scale_u8_grouped",
+                "rwkv_layer_step",
+            )
+        )
+        self.supports_layer_streaming_sequence = bool(
+            self.supports_layer_streaming
+            and hasattr(self.library, "rwkv_layer_step_sequence")
+        )
+        self.supports_layer_borrowed_u8 = bool(
+            self.supports_layer_streaming
+            and hasattr(self.library, "rwkv_layer_set_tensor_scale_u8_grouped_borrowed")
+        )
+        self.supports_layer_borrowed_dense = bool(
+            self.supports_layer_streaming
+            and hasattr(self.library, "rwkv_layer_set_tensor_borrowed")
+        )
+        self.supports_layer_persistent_dense = bool(
+            self.supports_layer_borrowed_dense
+            and hasattr(self.library, "rwkv_layer_set_tensor_borrowed_persistent")
+        )
+        self.supports_layer_invalidate_borrowed_cache = bool(
+            self.supports_layer_streaming
+            and hasattr(self.library, "rwkv_layer_invalidate_borrowed_cache")
+        )
+        self.supports_layer_persistent_u8 = bool(
+            self.supports_layer_borrowed_u8
+            and hasattr(
+                self.library,
+                "rwkv_layer_set_tensor_scale_u8_grouped_borrowed_persistent",
+            )
+        )
+        self.supports_layer_u8_batch = bool(
+            self.supports_layer_streaming
+            and hasattr(self.library, "rwkv_layer_set_tensor_scale_u8_grouped_batch")
+        )
+        self.supports_layer_ready = bool(
+            self.supports_layer_streaming
+            and hasattr(self.library, "rwkv_layer_is_ready")
+        )
+        self.supports_layer_cached_step = bool(
+            self.supports_layer_ready
+            and hasattr(self.library, "rwkv_layer_step_cached")
+            and hasattr(self.library, "rwkv_layer_cache_ready")
+        )
+        if self.supports_layer_streaming:
+            self.library.rwkv_supports_layer_streaming.argtypes = [ctypes.c_void_p]
+            self.library.rwkv_supports_layer_streaming.restype = ctypes.c_bool
+            self.library.rwkv_get_layer_state_len.argtypes = [ctypes.c_void_p]
+            self.library.rwkv_get_layer_state_len.restype = ctypes.c_size_t
+            self.library.rwkv_layer_begin.argtypes = [ctypes.c_void_p, ctypes.c_uint32]
+            self.library.rwkv_layer_begin.restype = ctypes.c_bool
+            if self.supports_layer_invalidate_borrowed_cache:
+                self.library.rwkv_layer_invalidate_borrowed_cache.argtypes = [
+                    ctypes.c_void_p,
+                    ctypes.c_uint32,
+                ]
+                self.library.rwkv_layer_invalidate_borrowed_cache.restype = ctypes.c_bool
+            if self.supports_layer_ready:
+                self.library.rwkv_layer_is_ready.argtypes = [
+                    ctypes.c_void_p,
+                    ctypes.c_uint32,
+                ]
+                self.library.rwkv_layer_is_ready.restype = ctypes.c_bool
+            if self.supports_layer_cached_step:
+                self.library.rwkv_layer_step_cached.argtypes = [
+                    ctypes.c_void_p,
+                    P_FLOAT,
+                    P_FLOAT,
+                    P_FLOAT,
+                    P_FLOAT,
+                    P_FLOAT,
+                    P_FLOAT,
+                ]
+                self.library.rwkv_layer_step_cached.restype = ctypes.c_bool
+                self.library.rwkv_layer_cache_ready.argtypes = [ctypes.c_void_p]
+                self.library.rwkv_layer_cache_ready.restype = ctypes.c_bool
+            self.library.rwkv_layer_set_tensor.argtypes = [
+                ctypes.c_void_p,
+                ctypes.c_char_p,
+                ctypes.c_void_p,
+                ctypes.c_size_t,
+            ]
+            self.library.rwkv_layer_set_tensor.restype = ctypes.c_bool
+            if self.supports_layer_borrowed_dense:
+                self.library.rwkv_layer_set_tensor_borrowed.argtypes = [
+                    ctypes.c_void_p,
+                    ctypes.c_char_p,
+                    ctypes.c_void_p,
+                    ctypes.c_size_t,
+                ]
+                self.library.rwkv_layer_set_tensor_borrowed.restype = ctypes.c_bool
+            if self.supports_layer_persistent_dense:
+                self.library.rwkv_layer_set_tensor_borrowed_persistent.argtypes = [
+                    ctypes.c_void_p,
+                    ctypes.c_char_p,
+                    ctypes.c_void_p,
+                    ctypes.c_size_t,
+                ]
+                self.library.rwkv_layer_set_tensor_borrowed_persistent.restype = ctypes.c_bool
+            self.library.rwkv_layer_set_tensor_scale_u8_grouped.argtypes = [
+                ctypes.c_void_p,
+                ctypes.c_char_p,
+                ctypes.c_void_p,
+                ctypes.c_size_t,
+            ]
+            self.library.rwkv_layer_set_tensor_scale_u8_grouped.restype = ctypes.c_bool
+            if self.supports_layer_borrowed_u8:
+                self.library.rwkv_layer_set_tensor_scale_u8_grouped_borrowed.argtypes = [
+                    ctypes.c_void_p,
+                    ctypes.c_char_p,
+                    ctypes.c_void_p,
+                    ctypes.c_size_t,
+                ]
+                self.library.rwkv_layer_set_tensor_scale_u8_grouped_borrowed.restype = ctypes.c_bool
+            if self.supports_layer_persistent_u8:
+                self.library.rwkv_layer_set_tensor_scale_u8_grouped_borrowed_persistent.argtypes = [
+                    ctypes.c_void_p,
+                    ctypes.c_char_p,
+                    ctypes.c_void_p,
+                    ctypes.c_size_t,
+                ]
+                self.library.rwkv_layer_set_tensor_scale_u8_grouped_borrowed_persistent.restype = ctypes.c_bool
+            if self.supports_layer_u8_batch:
+                self.library.rwkv_layer_set_tensor_scale_u8_grouped_batch.argtypes = [
+                    ctypes.c_void_p,
+                    ctypes.POINTER(ctypes.c_char_p),
+                    ctypes.POINTER(ctypes.c_void_p),
+                    ctypes.POINTER(ctypes.c_size_t),
+                    ctypes.c_size_t,
+                    ctypes.c_bool,
+                ]
+                self.library.rwkv_layer_set_tensor_scale_u8_grouped_batch.restype = ctypes.c_bool
+            self.library.rwkv_layer_step.argtypes = [
+                ctypes.c_void_p,
+                ctypes.c_uint32,
+                P_FLOAT,
+                P_FLOAT,
+                P_FLOAT,
+                P_FLOAT,
+                P_FLOAT,
+                P_FLOAT,
+            ]
+            self.library.rwkv_layer_step.restype = ctypes.c_bool
+            if self.supports_layer_streaming_sequence:
+                self.library.rwkv_layer_step_sequence.argtypes = [
+                    ctypes.c_void_p,
+                    ctypes.c_uint32,
+                    P_FLOAT,
+                    P_FLOAT,
+                    ctypes.c_size_t,
+                    P_FLOAT,
+                    P_FLOAT,
+                    P_FLOAT,
+                    P_FLOAT,
+                ]
+                self.library.rwkv_layer_step_sequence.restype = ctypes.c_bool
+
+            self.supports_layer_cache = all(
+                hasattr(self.library, name)
+                for name in (
+                    "rwkv_set_layer_cache_bytes",
+                    "rwkv_get_layer_cache_bytes",
+                    "rwkv_get_layer_cache_used_bytes",
+                    "rwkv_get_layer_cache_hits",
+                    "rwkv_get_layer_cache_misses",
+                    "rwkv_get_layer_cache_evictions",
+                )
+            )
+            if self.supports_layer_cache:
+                self.library.rwkv_set_layer_cache_bytes.argtypes = [
+                    ctypes.c_void_p,
+                    ctypes.c_size_t,
+                ]
+                self.library.rwkv_set_layer_cache_bytes.restype = ctypes.c_bool
+                for name in (
+                    "rwkv_get_layer_cache_bytes",
+                    "rwkv_get_layer_cache_used_bytes",
+                ):
+                    getattr(self.library, name).argtypes = [ctypes.c_void_p]
+                    getattr(self.library, name).restype = ctypes.c_size_t
+                for name in (
+                    "rwkv_get_layer_cache_hits",
+                    "rwkv_get_layer_cache_misses",
+                    "rwkv_get_layer_cache_evictions",
+                ):
+                    getattr(self.library, name).argtypes = [ctypes.c_void_p]
+                    getattr(self.library, name).restype = ctypes.c_uint64
+        else:
+            self.supports_layer_cache = False
 
         self.library.rwkv_eval.argtypes = [
             ctypes.c_void_p, # ctx
@@ -88,6 +344,22 @@ class RWKVSharedLibrary:
         self.library.rwkv_get_n_layer.argtypes = [ctypes.c_void_p]
         self.library.rwkv_get_n_layer.restype = ctypes.c_size_t
 
+        self.supports_model_state_metadata = all(
+            hasattr(self.library, name)
+            for name in (
+                "rwkv_get_arch_version_major",
+                "rwkv_get_head_count",
+                "rwkv_get_head_size",
+            )
+        )
+        if self.supports_model_state_metadata:
+            self.library.rwkv_get_arch_version_major.argtypes = [ctypes.c_void_p]
+            self.library.rwkv_get_arch_version_major.restype = ctypes.c_uint32
+            self.library.rwkv_get_head_count.argtypes = [ctypes.c_void_p]
+            self.library.rwkv_get_head_count.restype = ctypes.c_int64
+            self.library.rwkv_get_head_size.argtypes = [ctypes.c_void_p]
+            self.library.rwkv_get_head_size.restype = ctypes.c_int64
+
         self.library.rwkv_get_state_buffer_element_count.argtypes = [ctypes.c_void_p]
         self.library.rwkv_get_state_buffer_element_count.restype = ctypes.c_uint32
 
@@ -96,6 +368,9 @@ class RWKVSharedLibrary:
 
         self.library.rwkv_free.argtypes = [ctypes.c_void_p]
         self.library.rwkv_free.restype = None
+
+        self.library.rwkv_get_last_error.argtypes = [ctypes.c_void_p]
+        self.library.rwkv_get_last_error.restype = ctypes.c_int
 
         self.supports_tensor_upload = all(
             hasattr(self.library, name)
@@ -112,6 +387,23 @@ class RWKVSharedLibrary:
 
             self.library.rwkv_get_tensor_nbytes.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
             self.library.rwkv_get_tensor_nbytes.restype = ctypes.c_size_t
+
+        self.supports_tensor_type = hasattr(self.library, "rwkv_get_tensor_type")
+        if self.supports_tensor_type:
+            self.library.rwkv_get_tensor_type.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
+            self.library.rwkv_get_tensor_type.restype = ctypes.c_int32
+
+        self.supports_native_u8_upload = hasattr(
+            self.library, "rwkv_set_tensor_scale_u8_grouped"
+        )
+        if self.supports_native_u8_upload:
+            self.library.rwkv_set_tensor_scale_u8_grouped.argtypes = [
+                ctypes.c_void_p,
+                ctypes.c_char_p,
+                ctypes.c_void_p,
+                ctypes.c_size_t,
+            ]
+            self.library.rwkv_set_tensor_scale_u8_grouped.restype = ctypes.c_bool
 
         self.supports_tensor_slot_upload = all(
             hasattr(self.library, name)
@@ -135,7 +427,27 @@ class RWKVSharedLibrary:
 
         self.nullptr = ctypes.cast(0, ctypes.c_void_p)
 
-    def rwkv_init_from_file(self, model_file_path: str, thread_count: int, offload_layers: int) -> RWKVContext:
+    def raise_if_failed(
+        self, ok: bool, operation: str, ctx: RWKVContext
+    ) -> None:
+        """Turn the C boolean error contract into an actionable exception."""
+        if ok:
+            return
+        error_flags = int(self.library.rwkv_get_last_error(ctx.ptr))
+        raise ValueError(
+            f'{operation} failed (error flags {error_flags}), check stderr'
+        )
+
+    def rwkv_init_from_file(
+        self,
+        model_file_path: str,
+        thread_count: int,
+        offload_layers: int,
+        *,
+        native_u8: bool = False,
+        native_u8_packed_only: bool = False,
+        layer_streaming: bool = False,
+    ) -> RWKVContext:
         """
         Loads the model from a file and prepares it for inference.
         Throws an exception in case of any error. Error messages would be printed to stderr.
@@ -148,12 +460,328 @@ class RWKVSharedLibrary:
             Count of threads to use, must be positive.
         """
 
-        ptr = self.library.rwkv_init_from_file(model_file_path.encode('utf-8'), ctypes.c_uint32(thread_count), ctypes.c_uint32(offload_layers))
+        encoded_path = model_file_path.encode('utf-8')
+        if layer_streaming and not self.supports_layer_streaming:
+            raise NotImplementedError(
+                "rwkv.cpp library lacks the native layer-streaming ABI; rebuild "
+                "the vendored backend before selecting an F1-F4 rwkv.cpp tier"
+            )
+        if (native_u8 or layer_streaming) and self.supports_native_u8_init:
+            flags = (1 if native_u8 else 0) | (2 if native_u8_packed_only else 0)
+            flags |= 4 if layer_streaming else 0
+            ptr = self.library.rwkv_init_from_file_ex(
+                encoded_path,
+                ctypes.c_uint32(thread_count),
+                ctypes.c_uint32(offload_layers),
+                ctypes.c_uint32(flags),
+            )
+        else:
+            ptr = self.library.rwkv_init_from_file(
+                encoded_path,
+                ctypes.c_uint32(thread_count),
+                ctypes.c_uint32(offload_layers),
+            )
 
         if ptr is None:
             raise ValueError('rwkv_init_from_file failed, check stderr')
 
         return RWKVContext(ptr)
+
+    def rwkv_supports_layer_streaming(self, ctx: RWKVContext) -> bool:
+        if not self.supports_layer_streaming:
+            return False
+        return bool(self.library.rwkv_supports_layer_streaming(ctx.ptr))
+
+    def rwkv_get_layer_state_len(self, ctx: RWKVContext) -> int:
+        if not self.supports_layer_streaming:
+            return 0
+        return int(self.library.rwkv_get_layer_state_len(ctx.ptr))
+
+    def rwkv_layer_begin(self, ctx: RWKVContext, layer_id: int) -> None:
+        if not self.supports_layer_streaming:
+            raise NotImplementedError("native layer-streaming ABI is unavailable")
+        ok = self.library.rwkv_layer_begin(
+            ctx.ptr, ctypes.c_uint32(int(layer_id))
+        )
+        self.raise_if_failed(ok, "rwkv_layer_begin", ctx)
+
+    def rwkv_layer_invalidate_borrowed_cache(
+        self, ctx: RWKVContext, layer_id: int
+    ) -> None:
+        if not getattr(self, "supports_layer_invalidate_borrowed_cache", False):
+            return
+        ok = self.library.rwkv_layer_invalidate_borrowed_cache(
+            ctx.ptr, ctypes.c_uint32(int(layer_id))
+        )
+        self.raise_if_failed(ok, "rwkv_layer_invalidate_borrowed_cache", ctx)
+
+    def rwkv_layer_is_ready(self, ctx: RWKVContext, layer_id: int) -> bool:
+        if not getattr(self, "supports_layer_ready", False):
+            return False
+        return bool(
+            self.library.rwkv_layer_is_ready(ctx.ptr, ctypes.c_uint32(int(layer_id)))
+        )
+
+    def rwkv_layer_cache_ready(self, ctx: RWKVContext) -> bool:
+        if not getattr(self, "supports_layer_cached_step", False):
+            return False
+        return bool(self.library.rwkv_layer_cache_ready(ctx.ptr))
+
+    def rwkv_layer_step_cached(
+        self,
+        ctx: RWKVContext,
+        activation_in_address: int,
+        activation_out_address: int,
+        state_in_address: int,
+        state_out_address: int,
+        v_first_in_address: int | None,
+        v_first_out_address: int | None,
+    ) -> None:
+        if not getattr(self, "supports_layer_cached_step", False):
+            raise NotImplementedError("native cached layer-step ABI is unavailable")
+        ok = self.library.rwkv_layer_step_cached(
+            ctx.ptr,
+            ctypes.cast(int(activation_in_address), P_FLOAT),
+            ctypes.cast(int(activation_out_address), P_FLOAT),
+            ctypes.cast(int(state_in_address), P_FLOAT),
+            ctypes.cast(int(state_out_address), P_FLOAT),
+            ctypes.cast(
+                0 if v_first_in_address is None else int(v_first_in_address), P_FLOAT
+            ),
+            ctypes.cast(
+                0 if v_first_out_address is None else int(v_first_out_address), P_FLOAT
+            ),
+        )
+        self.raise_if_failed(ok, "rwkv_layer_step_cached", ctx)
+
+    def rwkv_layer_set_tensor(
+        self, ctx: RWKVContext, name: str, data: bytes | memoryview
+    ) -> None:
+        if not self.supports_layer_streaming:
+            raise NotImplementedError("native layer-streaming ABI is unavailable")
+        pointer, _holder, nbytes = _native_buffer_pointer(data)
+        ok = self.library.rwkv_layer_set_tensor(
+            ctx.ptr,
+            name.encode("utf-8"),
+            pointer,
+            ctypes.c_size_t(nbytes),
+        )
+        self.raise_if_failed(ok, "rwkv_layer_set_tensor", ctx)
+
+    def rwkv_layer_set_tensor_borrowed(
+        self,
+        ctx: RWKVContext,
+        name: str,
+        address: int,
+        nbytes: int,
+        *,
+        persistent: bool = False,
+    ) -> None:
+        supported = (
+            getattr(self, "supports_layer_persistent_dense", False)
+            if persistent
+            else getattr(self, "supports_layer_borrowed_dense", False)
+        )
+        if not supported:
+            raise NotImplementedError("borrowed dense layer ABI is unavailable")
+        symbol = (
+            self.library.rwkv_layer_set_tensor_borrowed_persistent
+            if persistent
+            else self.library.rwkv_layer_set_tensor_borrowed
+        )
+        ok = symbol(
+            ctx.ptr,
+            str(name).encode("utf-8"),
+            ctypes.c_void_p(int(address)),
+            ctypes.c_size_t(int(nbytes)),
+        )
+        self.raise_if_failed(
+            ok,
+            "rwkv_layer_set_tensor_borrowed_persistent"
+            if persistent
+            else "rwkv_layer_set_tensor_borrowed",
+            ctx,
+        )
+
+    def rwkv_layer_set_tensor_scale_u8_grouped(
+        self, ctx: RWKVContext, name: str, data: bytes | memoryview
+    ) -> None:
+        if not self.supports_layer_streaming:
+            raise NotImplementedError("native layer-streaming ABI is unavailable")
+        pointer, _holder, nbytes = _native_buffer_pointer(data)
+        ok = self.library.rwkv_layer_set_tensor_scale_u8_grouped(
+            ctx.ptr,
+            name.encode("utf-8"),
+            pointer,
+            ctypes.c_size_t(nbytes),
+        )
+        self.raise_if_failed(ok, "rwkv_layer_set_tensor_scale_u8_grouped", ctx)
+
+    def rwkv_layer_set_tensor_scale_u8_grouped_borrowed(
+        self, ctx: RWKVContext, name: str, data: bytes | memoryview
+    ) -> object:
+        if not getattr(self, "supports_layer_borrowed_u8", False):
+            raise NotImplementedError("borrowed grouped-U8 ABI is unavailable")
+        pointer, holder, nbytes = _native_buffer_pointer(data)
+        ok = self.library.rwkv_layer_set_tensor_scale_u8_grouped_borrowed(
+            ctx.ptr,
+            name.encode("utf-8"),
+            pointer,
+            ctypes.c_size_t(nbytes),
+        )
+        self.raise_if_failed(
+            ok, "rwkv_layer_set_tensor_scale_u8_grouped_borrowed", ctx
+        )
+        # ``holder`` is part of the borrowed pointer lifetime for read-only
+        # bytes and non-buffer-compatible views.  The model retains it until
+        # the next layer_begin.
+        return holder
+
+    def rwkv_layer_set_tensor_scale_u8_grouped_borrowed_persistent(
+        self, ctx: RWKVContext, name: str, data: bytes | memoryview
+    ) -> object:
+        if not getattr(self, "supports_layer_persistent_u8", False):
+            raise NotImplementedError("persistent borrowed grouped-U8 ABI is unavailable")
+        pointer, holder, nbytes = _native_buffer_pointer(data)
+        ok = self.library.rwkv_layer_set_tensor_scale_u8_grouped_borrowed_persistent(
+            ctx.ptr,
+            name.encode("utf-8"),
+            pointer,
+            ctypes.c_size_t(nbytes),
+        )
+        self.raise_if_failed(
+            ok,
+            "rwkv_layer_set_tensor_scale_u8_grouped_borrowed_persistent",
+            ctx,
+        )
+        return holder
+
+    def rwkv_layer_set_tensor_scale_u8_grouped_batch(
+        self,
+        ctx: RWKVContext,
+        items: list[tuple[str, bytes | memoryview]],
+        *,
+        persistent: bool = False,
+    ) -> list[tuple[str, object, bytes | memoryview]]:
+        if not getattr(self, "supports_layer_u8_batch", False):
+            raise NotImplementedError("grouped-U8 batch ABI is unavailable")
+        if not items:
+            return []
+        names = (ctypes.c_char_p * len(items))()
+        pointers = (ctypes.c_void_p * len(items))()
+        sizes = (ctypes.c_size_t * len(items))()
+        owners: list[tuple[str, object, bytes | memoryview]] = []
+        for index, (name, data) in enumerate(items):
+            pointer, holder, nbytes = _native_buffer_pointer(data)
+            names[index] = str(name).encode("utf-8")
+            pointers[index] = pointer
+            sizes[index] = nbytes
+            owners.append((str(name), holder, data))
+        ok = self.library.rwkv_layer_set_tensor_scale_u8_grouped_batch(
+            ctx.ptr,
+            names,
+            pointers,
+            sizes,
+            ctypes.c_size_t(len(items)),
+            ctypes.c_bool(bool(persistent)),
+        )
+        self.raise_if_failed(ok, "rwkv_layer_set_tensor_scale_u8_grouped_batch", ctx)
+        return owners
+
+    def rwkv_layer_step(
+        self,
+        ctx: RWKVContext,
+        layer_id: int,
+        activation_in_address: int,
+        activation_out_address: int,
+        state_in_address: int | None,
+        state_out_address: int,
+        v_first_in_address: int | None,
+        v_first_out_address: int | None,
+    ) -> None:
+        if not self.supports_layer_streaming:
+            raise NotImplementedError("native layer-streaming ABI is unavailable")
+        ok = self.library.rwkv_layer_step(
+            ctx.ptr,
+            ctypes.c_uint32(int(layer_id)),
+            ctypes.cast(int(activation_in_address), P_FLOAT),
+            ctypes.cast(int(activation_out_address), P_FLOAT),
+            ctypes.cast(
+                0 if state_in_address is None else int(state_in_address), P_FLOAT
+            ),
+            ctypes.cast(int(state_out_address), P_FLOAT),
+            ctypes.cast(
+                0 if v_first_in_address is None else int(v_first_in_address), P_FLOAT
+            ),
+            ctypes.cast(
+                0 if v_first_out_address is None else int(v_first_out_address), P_FLOAT
+            ),
+        )
+        self.raise_if_failed(ok, "rwkv_layer_step", ctx)
+
+    def rwkv_layer_step_sequence(
+        self,
+        ctx: RWKVContext,
+        layer_id: int,
+        activation_in_address: int,
+        activation_out_address: int,
+        n_tokens: int,
+        state_in_address: int | None,
+        state_out_address: int,
+        v_first_in_address: int | None,
+        v_first_out_address: int | None,
+    ) -> None:
+        if not self.supports_layer_streaming_sequence:
+            raise NotImplementedError(
+                "rwkv.cpp library lacks the native layer sequence ABI"
+            )
+        ok = self.library.rwkv_layer_step_sequence(
+            ctx.ptr,
+            ctypes.c_uint32(int(layer_id)),
+            ctypes.cast(int(activation_in_address), P_FLOAT),
+            ctypes.cast(int(activation_out_address), P_FLOAT),
+            ctypes.c_size_t(int(n_tokens)),
+            ctypes.cast(
+                0 if state_in_address is None else int(state_in_address), P_FLOAT
+            ),
+            ctypes.cast(int(state_out_address), P_FLOAT),
+            ctypes.cast(
+                0 if v_first_in_address is None else int(v_first_in_address), P_FLOAT
+            ),
+            ctypes.cast(
+                0 if v_first_out_address is None else int(v_first_out_address), P_FLOAT
+            ),
+        )
+        self.raise_if_failed(ok, "rwkv_layer_step_sequence", ctx)
+
+    def rwkv_set_layer_cache_bytes(self, ctx: RWKVContext, bytes_limit: int) -> None:
+        if not getattr(self, "supports_layer_cache", False):
+            raise NotImplementedError("native layer cache ABI is unavailable")
+        ok = self.library.rwkv_set_layer_cache_bytes(
+            ctx.ptr, ctypes.c_size_t(max(0, int(bytes_limit)))
+        )
+        self.raise_if_failed(ok, "rwkv_set_layer_cache_bytes", ctx)
+
+    def rwkv_get_layer_cache_stats(self, ctx: RWKVContext) -> dict[str, int]:
+        if not getattr(self, "supports_layer_cache", False):
+            return {
+                "limit_bytes": 0,
+                "used_bytes": 0,
+                "hits": 0,
+                "misses": 0,
+                "evictions": 0,
+            }
+        return {
+            "limit_bytes": int(self.library.rwkv_get_layer_cache_bytes(ctx.ptr)),
+            "used_bytes": int(
+                self.library.rwkv_get_layer_cache_used_bytes(ctx.ptr)
+            ),
+            "hits": int(self.library.rwkv_get_layer_cache_hits(ctx.ptr)),
+            "misses": int(self.library.rwkv_get_layer_cache_misses(ctx.ptr)),
+            "evictions": int(
+                self.library.rwkv_get_layer_cache_evictions(ctx.ptr)
+            ),
+        }
 
     def rwkv_eval(
             self,
@@ -182,14 +810,14 @@ class RWKVSharedLibrary:
             Address of the first element of a FP32 buffer of size rwkv_get_logits_buffer_element_count. This buffer will be written to.
         """
 
-        if not self.library.rwkv_eval(
+        ok = self.library.rwkv_eval(
             ctx.ptr,
             ctypes.c_int32(token),
             ctypes.cast(0 if state_in_address is None else state_in_address, P_FLOAT),
             ctypes.cast(state_out_address, P_FLOAT),
             ctypes.cast(logits_out_address, P_FLOAT)
-        ):
-            raise ValueError('rwkv_eval failed, check stderr')
+        )
+        self.raise_if_failed(ok, 'rwkv_eval', ctx)
 
     def rwkv_set_tensor(self, ctx: RWKVContext, name: str, data: bytes) -> None:
         """Replace one loaded tensor using its exact ggml-native bytes."""
@@ -235,10 +863,37 @@ class RWKVSharedLibrary:
         if not ok:
             raise ValueError(f'rwkv_set_tensor failed for {name!r}, check stderr')
 
+    def rwkv_set_tensor_scale_u8_grouped(
+        self, ctx: RWKVContext, name: str, data: bytes | memoryview
+    ) -> None:
+        """Upload one packed SG8 grouped-U8 tensor to the native CPU graph."""
+        if not self.supports_native_u8_upload:
+            raise NotImplementedError(
+                "rwkv.cpp library lacks the grouped-U8 upload ABI; rebuild the "
+                "vendored backend"
+            )
+        payload = ctypes.create_string_buffer(bytes(data))
+        ok = self.library.rwkv_set_tensor_scale_u8_grouped(
+            ctx.ptr,
+            name.encode("utf-8"),
+            ctypes.cast(payload, ctypes.c_void_p),
+            ctypes.c_size_t(len(payload) - 1),
+        )
+        if not ok:
+            raise ValueError(
+                f'rwkv_set_tensor_scale_u8_grouped failed for {name!r}, check stderr'
+            )
+
     def rwkv_get_tensor_nbytes(self, ctx: RWKVContext, name: str) -> int:
         if not self.supports_tensor_upload:
             return 0
         return int(self.library.rwkv_get_tensor_nbytes(ctx.ptr, name.encode('utf-8')))
+
+    def rwkv_get_tensor_type(self, ctx: RWKVContext, name: str) -> int:
+        """Return the loaded tensor's numeric ggml type, or -1 if unavailable."""
+        if not self.supports_tensor_type:
+            return -1
+        return int(self.library.rwkv_get_tensor_type(ctx.ptr, name.encode("utf-8")))
 
     def rwkv_register_tensor_slot(self, ctx: RWKVContext, slot_id: int, buffer: bytearray) -> None:
         view = (ctypes.c_ubyte * len(buffer)).from_buffer(buffer)
@@ -289,15 +944,15 @@ class RWKVSharedLibrary:
             Address of the first element of a FP32 buffer of size rwkv_get_logits_buffer_element_count. This buffer will be written to.
         """
 
-        if not self.library.rwkv_eval_sequence(
+        ok = self.library.rwkv_eval_sequence(
             ctx.ptr,
             ctypes.cast((ctypes.c_int32 * len(tokens))(*tokens), P_INT),
             ctypes.c_size_t(len(tokens)),
             ctypes.cast(0 if state_in_address is None else state_in_address, P_FLOAT),
             ctypes.cast(state_out_address, P_FLOAT),
             ctypes.cast(logits_out_address, P_FLOAT)
-        ):
-            raise ValueError('rwkv_eval_sequence failed, check stderr')
+        )
+        self.raise_if_failed(ok, 'rwkv_eval_sequence', ctx)
 
     def rwkv_eval_sequence_in_chunks(
             self,
@@ -336,7 +991,7 @@ class RWKVSharedLibrary:
             Address of the first element of a FP32 buffer of size rwkv_get_logits_buffer_element_count. This buffer will be written to.
         """
 
-        if not self.library.rwkv_eval_sequence_in_chunks(
+        ok = self.library.rwkv_eval_sequence_in_chunks(
             ctx.ptr,
             ctypes.cast((ctypes.c_int32 * len(tokens))(*tokens), P_INT),
             ctypes.c_size_t(len(tokens)),
@@ -344,8 +999,8 @@ class RWKVSharedLibrary:
             ctypes.cast(0 if state_in_address is None else state_in_address, P_FLOAT),
             ctypes.cast(state_out_address, P_FLOAT),
             ctypes.cast(logits_out_address, P_FLOAT)
-        ):
-            raise ValueError('rwkv_eval_sequence_in_chunks failed, check stderr')
+        )
+        self.raise_if_failed(ok, 'rwkv_eval_sequence_in_chunks', ctx)
 
     def rwkv_get_n_vocab(self, ctx: RWKVContext) -> int:
         """

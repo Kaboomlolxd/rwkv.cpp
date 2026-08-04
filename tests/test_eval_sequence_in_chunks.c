@@ -8,7 +8,7 @@
 #include "assertions.inc"
 
 void test_on_prompt(const char * prompt, const size_t prompt_length) {
-    fprintf(stderr, "Calculating expected state and logits for prompt of size %zd\n", prompt_length);
+    fprintf(stderr, "Calculating expected state and logits for prompt of size %llu\n", (unsigned long long) prompt_length);
 
     struct rwkv_context * ctx = rwkv_init_from_file("tiny-rwkv-5v2-730K-FP32.bin", 2, 0);
 
@@ -47,7 +47,7 @@ void test_on_prompt(const char * prompt, const size_t prompt_length) {
     for (int i = 0; i < 4; i++) {
         size_t chunk_size = chunk_sizes[i];
 
-        fprintf(stderr, "Testing chunk_size = %zd\n", chunk_size);
+        fprintf(stderr, "Testing chunk_size = %llu\n", (unsigned long long) chunk_size);
 
         rwkv_eval_sequence_in_chunks(ctx, prompt_tokens, prompt_length, chunk_size, NULL, state, logits);
 

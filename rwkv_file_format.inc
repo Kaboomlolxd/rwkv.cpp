@@ -274,7 +274,12 @@ static bool rwkv_fread_ggml_tensor_info(FILE * file, struct ggml_context * ctx, 
     return true;
 }
 
-static bool rwkv_fread_ggml_tensor_data(FILE * file, std::unordered_map<std::string, struct ggml_tensor *> & parameters) {
+template<typename F>
+static bool rwkv_fread_ggml_tensor_data(
+    FILE * file,
+    std::unordered_map<std::string, struct ggml_tensor *> & parameters,
+    F should_skip
+) {
     struct rwkv_tensor_header header;
     std::string name;
     RWKV_ENSURE_OR_FALSE_MSG(rwkv_fread_tensor_header(file, header), "Invalid tensor header");
@@ -298,6 +303,22 @@ static bool rwkv_fread_ggml_tensor_data(FILE * file, std::unordered_map<std::str
         "Parameter %s not found in the model",
         name.c_str()
     );
+
+    // The metadata pass already created a shape-only tensor for every
+    // parameter.  Packed-U8 mode can intentionally leave large matrix
+    // tensors unallocated: advance over their checkpoint payload without
+    // allocating a temporary read buffer or attempting to write into a null
+    // GGML data pointer.  The grouped-U8 bridge will populate the matrix
+    // descriptor after model construction.
+    if (should_skip(name, tensor)) {
+        RWKV_ASSERT_FALSE_MSG(
+            RWKV_ERROR_FILE_READ,
+            !fseek(file, rwkv_tensor_nbytes(tensor), SEEK_CUR),
+            "Failed to seek over packed parameter %s",
+            name.c_str()
+        );
+        return true;
+    }
 
     char * data = (char *) malloc(rwkv_tensor_nbytes(tensor));
 

@@ -38,9 +38,23 @@ static void rwkv_eval_graph(struct rwkv_computation_graph & graph, const bool co
 bool rwkv_eval(struct rwkv_context * ctx, const uint32_t token, const float * state_in, float * state_out, float * logits_out) {
     ctx->last_error = RWKV_ERROR_NONE;
 
+    RWKV_CTX_ASSERT_FALSE_MSG(
+        ctx,
+        RWKV_ERROR_DATA,
+        rwkv_native_u8_model_ready(*ctx->model),
+        "Native grouped-U8 model has tensors that were not uploaded"
+    );
+
     const struct rwkv_file_header & header = ctx->model->header;
     const size_t n_vocab = header.n_vocab;
-    RWKV_CTX_ASSERT_FALSE_MSG(ctx, RWKV_ERROR_ARGS, token < n_vocab, "Token (%" PRId32 ") is out of range (0 .. %zu)", token, n_vocab - 1);
+    RWKV_CTX_ASSERT_FALSE_MSG(
+        ctx,
+        RWKV_ERROR_ARGS,
+        token < n_vocab,
+        "Token (%u) is out of range (0 .. %llu)",
+        static_cast<unsigned int>(token),
+        static_cast<unsigned long long>(n_vocab - 1)
+    );
 
     if (!ctx->serial_graph.sched) {
         ctx->serial_graph.sched = ggml_backend_sched_new(ctx->model->backends.data(), NULL, ctx->model->backends.size(), RWKV_MAX_NODES, false);
@@ -86,6 +100,13 @@ bool rwkv_eval_sequence(
 ) {
     ctx->last_error = RWKV_ERROR_NONE;
 
+    RWKV_CTX_ASSERT_FALSE_MSG(
+        ctx,
+        RWKV_ERROR_DATA,
+        rwkv_native_u8_model_ready(*ctx->model),
+        "Native grouped-U8 model has tensors that were not uploaded"
+    );
+
     RWKV_CTX_ASSERT_FALSE_MSG(ctx, RWKV_ERROR_ARGS, sequence_len > 0, "Sequence length is 0");
 
     if (sequence_len == 1) {
@@ -105,7 +126,15 @@ bool rwkv_eval_sequence(
         for (size_t i = 0; i < sequence_len; i++) {
             const uint32_t token = sequence[i];
 
-            RWKV_CTX_ASSERT_FALSE_MSG(ctx, RWKV_ERROR_ARGS, token < n_vocab, "Token at index %zu (%" PRId32 ") is out of range (0 .. %zu)", i, token, n_vocab - 1);
+            RWKV_CTX_ASSERT_FALSE_MSG(
+                ctx,
+                RWKV_ERROR_ARGS,
+                token < n_vocab,
+                "Token at index %llu (%u) is out of range (0 .. %llu)",
+                static_cast<unsigned long long>(i),
+                static_cast<unsigned int>(token),
+                static_cast<unsigned long long>(n_vocab - 1)
+            );
         }
     }
 

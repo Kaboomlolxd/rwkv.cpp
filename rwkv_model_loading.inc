@@ -1,3 +1,5 @@
+struct rwkv_u8_grouped_matrix;
+
 struct rwkv_layer {
     struct ggml_tensor * ln1_weight;
     struct ggml_tensor * ln1_bias;
@@ -107,6 +109,22 @@ struct rwkv_model {
     // rebuilding the ggml graph or reloading the model file.
     std::unordered_map<std::string, struct ggml_tensor *> tensors;
 
+    // Optional CPU-native grouped-U8 dispatch state.  The descriptors are
+    // created before the computation graphs are measured, so custom GGML
+    // nodes can retain stable userdata pointers while the packed blobs are
+    // refreshed by the SSD upload ABI.
+    bool native_u8_enabled = false;
+    // When set, matrix payloads are omitted from the dense GGML weight
+    // buffer and every non-control 2-D tensor must be supplied through the
+    // grouped-U8 upload ABI before evaluation.  The ordinary native-U8 mode
+    // keeps dense storage as a compatibility fallback.
+    bool native_u8_packed_only = false;
+    // Layer-local mode retains tensor metadata only.  The active block is
+    // materialized in rwkv_layer_plan's bounded weight buffer.
+    bool layer_streaming = false;
+    std::unordered_map<struct ggml_tensor *, std::unique_ptr<struct rwkv_u8_grouped_matrix>> native_u8_by_tensor;
+    std::unordered_map<std::string, struct rwkv_u8_grouped_matrix *> native_u8_by_name;
+
     struct tensor_slot {
         const uint8_t * data;
         size_t nbytes;
@@ -124,6 +142,30 @@ struct rwkv_model {
     // How many RWKV contexts reference this model.
     int reference_count;
 };
+
+// These RWKV-7 tensors are small elementwise/broadcast controls.  They may
+// be present in a grouped-U8 pack, but they still need ordinary GGML storage
+// because the graph consumes them through ggml_mul/add rather than a native
+// matrix node.  The synthetic att.x_rwkvag target is also uploaded through
+// the legacy dense ABI after its six source vectors are concatenated.
+static bool rwkv_native_u8_dense_control_name(const std::string & name) {
+    return name.find(".att.x_rwkvag") != std::string::npos ||
+           name.find(".att.r_k") != std::string::npos ||
+           name.find(".att.k_k") != std::string::npos ||
+           name.find(".att.k_a") != std::string::npos;
+}
+
+static bool rwkv_native_u8_omit_dense_payload(
+    const rwkv_model & model,
+    const std::string & name,
+    const struct ggml_tensor * tensor
+) {
+    if (!model.native_u8_enabled || !model.native_u8_packed_only ||
+        tensor == nullptr || ggml_n_dims(tensor) != 2) {
+        return false;
+    }
+    return !rwkv_native_u8_dense_control_name(name);
+}
 
 struct rwkv_file {
     FILE * file;
@@ -299,7 +341,12 @@ static bool rwkv_set_params(struct rwkv_model & model, F callback, const uint32_
 }
 
 // Creates a ggml context and loads all parameter tensors from a model file.
-static bool rwkv_load_model_from_file(const char * file_path, struct rwkv_model & model, const uint32_t n_gpu_layers) {
+static bool rwkv_load_model_from_file(
+    const char * file_path,
+    struct rwkv_model & model,
+    const uint32_t n_gpu_layers,
+    const bool layer_streaming
+) {
     struct stat file_stat;
 
     std::unordered_map<std::string, struct ggml_tensor *> parameters;
@@ -362,10 +409,12 @@ static bool rwkv_load_model_from_file(const char * file_path, struct rwkv_model 
         [&](const char * key, struct ggml_tensor *& dest, bool offload_gpu) {
             struct ggml_tensor * tensor = parameters_ref[key];
             RWKV_ENSURE_OR_FALSE_MSG(tensor, "Model parameter %s not found", key);
-            if (offload_gpu && n_gpu_layers)
-                gpu_buffer_size += ggml_nbytes(tensor);
-            else
-                cpu_buffer_size += ggml_nbytes(tensor);
+            if (!layer_streaming && !rwkv_native_u8_omit_dense_payload(model, key, tensor)) {
+                if (offload_gpu && n_gpu_layers)
+                    gpu_buffer_size += ggml_nbytes(tensor);
+                else
+                    cpu_buffer_size += ggml_nbytes(tensor);
+            }
             dest = tensor;
             return true;
         },
@@ -398,8 +447,10 @@ static bool rwkv_load_model_from_file(const char * file_path, struct rwkv_model 
         [&](const char * key, struct ggml_tensor *& dest, bool offload_gpu) {
             struct ggml_tensor * tensor = parameters_ref[key];
             RWKV_ENSURE_OR_FALSE_MSG(tensor, "Model parameter %s not found", key);
-            ggml_tallocr * alloc = offload_gpu ? &model.tallocrs.front() : &model.tallocrs.back();
-            ggml_tallocr_alloc(alloc, tensor);
+            if (!layer_streaming && !rwkv_native_u8_omit_dense_payload(model, key, tensor)) {
+                ggml_tallocr * alloc = offload_gpu ? &model.tallocrs.front() : &model.tallocrs.back();
+                ggml_tallocr_alloc(alloc, tensor);
+            }
             dest = tensor;
             return true;
         },
@@ -410,7 +461,13 @@ static bool rwkv_load_model_from_file(const char * file_path, struct rwkv_model 
     fseek(file.file, tensors_file_start, SEEK_SET);
     while ((size_t) ftell(file.file) < (size_t) file_stat.st_size) {
         RWKV_ASSERT_FALSE_MSG(RWKV_ERROR_MODEL_PARAMS, 
-            rwkv_fread_ggml_tensor_data(file.file, parameters_ref),
+            rwkv_fread_ggml_tensor_data(
+                file.file,
+                parameters_ref,
+                [&](const std::string & key, const struct ggml_tensor * tensor) {
+                    return layer_streaming || rwkv_native_u8_omit_dense_payload(model, key, tensor);
+                }
+            ),
             "Failed to read a model parameter");
     }
 

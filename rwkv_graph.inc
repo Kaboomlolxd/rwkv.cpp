@@ -1,4 +1,7 @@
 // View tensors of a state of a single layer.
+#define ggml_mul_mat rwkv_mul_mat
+#define ggml_get_rows rwkv_get_rows
+
 struct rwkv_layer_state {
     struct ggml_tensor * ffn_xx;
     struct ggml_tensor * att_xx;
@@ -36,6 +39,8 @@ struct rwkv_computation_graph {
     int post_logits_leafs;
 };
 
+struct rwkv_layer_plan;
+
 // The context holds the model and both serial and sequential computation graphs.
 struct rwkv_context {
     struct rwkv_model * model;
@@ -46,6 +51,41 @@ struct rwkv_context {
     // This can be an order of magnitude or so faster than serial execution if used properly.
     struct rwkv_computation_graph sequential_graph;
     size_t last_used_sequence_length;
+
+    // Optional native single-block plans.  They are allocated lazily and are
+    // independent of the resident serial/sequential graph.
+    std::unique_ptr<struct rwkv_layer_plan> layer_plan_zero;
+    std::unique_ptr<struct rwkv_layer_plan> layer_plan_rest;
+    // Upload calls do not carry a layer id in the ABI.  Keep the exact plan
+    // selected by the most recent rwkv_layer_begin() instead of inferring it
+    // from the plan's historical active_layer value.
+    struct rwkv_layer_plan * active_layer_plan = nullptr;
+
+    // Optional bounded decoded-payload cache for the native layer-local ABI.
+    // Entries are dense GGML-native bytes keyed by layer and tensor suffix;
+    // the active plan still owns the only executable weight arena.  Keeping
+    // this cache on the context makes the limit explicit and keeps clones
+    // independent, which is important for process workers and cancellation.
+    std::unordered_map<std::string, std::vector<uint8_t>> layer_cache;
+    std::unordered_map<std::string, uint64_t> layer_cache_lru;
+    size_t layer_cache_limit_bytes = 0;
+    size_t layer_cache_used_bytes = 0;
+    uint64_t layer_cache_clock = 0;
+    uint64_t layer_cache_hits = 0;
+    uint64_t layer_cache_misses = 0;
+    uint64_t layer_cache_evictions = 0;
+    // Completeness is stable between uploads/cache-limit changes.  The
+    // Python decode loop asks this capability once per token, so avoid
+    // rescanning every layer/tensor map after the native cache is qualified.
+    bool layer_cache_ready_cached = false;
+
+    // Reusable scratch for the cached all-layer token step.  These are
+    // activations only (not weights) and avoid allocating vectors for every
+    // autoregressive token.
+    std::vector<float> cached_activation_a;
+    std::vector<float> cached_activation_b;
+    std::vector<float> cached_v_first_a;
+    std::vector<float> cached_v_first_b;
 
     uint32_t n_threads;
 
@@ -609,6 +649,7 @@ static void rwkv_create_input_and_output_views(
 
 // Creates and sets the input and output ggml tensors, builds the computation graph.
 static bool rwkv_build_serial_graph(struct rwkv_model & model, struct rwkv_computation_graph & graph) {
+    rwkv_graph_model_scope graph_model_scope(model);
     if (!graph.cgraph) {
         graph.cgraph = ggml_new_graph_custom(graph.ggml_ctx, RWKV_MAX_NODES, false);
     }
@@ -742,6 +783,7 @@ static bool rwkv_measure_and_build_serial_context(struct rwkv_model & model, str
 
 // Creates and sets the input and output ggml tensors, builds the computation graph.
 static bool rwkv_build_sequential_graph(struct rwkv_model & model, struct rwkv_computation_graph & graph, const size_t sequence_length) {
+    rwkv_graph_model_scope graph_model_scope(model);
     if (!graph.cgraph) {
         graph.cgraph = ggml_new_graph_custom(graph.ggml_ctx, RWKV_MAX_NODES, false);
     }
@@ -864,6 +906,9 @@ static bool rwkv_build_sequential_graph(struct rwkv_model & model, struct rwkv_c
 
     return true;
 }
+
+#undef ggml_mul_mat
+#undef ggml_get_rows
 
 // Prepares the computation graph for inference, measuring and allocating all input and output tensors.
 static bool rwkv_measure_and_build_sequential_context(struct rwkv_model & model, struct rwkv_computation_graph & graph, const size_t sequence_length) {

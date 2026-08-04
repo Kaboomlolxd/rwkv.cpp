@@ -21,7 +21,7 @@ void load_expected_logits(float * expected_logits, const char * version) {
     FILE * file = fopen(file_name, "rb");
     ASSERT(file != NULL, "Failed to open %s", file_name);
     size_t elements_read = fread(expected_logits, sizeof(float), N_VOCAB, file);
-    ASSERT(elements_read == N_VOCAB, "Failed to read expected_logits.bin, read %zd elements", elements_read);
+    ASSERT(elements_read == N_VOCAB, "Failed to read expected_logits.bin, read %llu elements", (unsigned long long) elements_read);
     fclose(file);
 }
 

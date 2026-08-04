@@ -63,19 +63,36 @@ static_assert(sizeof(decltype(ftell(NULL))) >= 8, "File offsets should be 64-bit
 
 #include "rwkv_model_loading.inc"
 
+#include "rwkv_native_u8.inc"
+
 #include "rwkv_operators.inc"
 
 #include "rwkv_graph.inc"
+#include "rwkv_layer.inc"
 
-// API function.
-struct rwkv_context * rwkv_init_from_file(const char * file_path, const uint32_t n_threads, const uint32_t n_gpu_layers) {
+static struct rwkv_context * rwkv_init_from_file_impl(
+    const char * file_path,
+    const uint32_t n_threads,
+    const uint32_t n_gpu_layers,
+    const bool native_u8,
+    const bool native_u8_packed_only,
+    const bool layer_streaming
+) {
     global_last_error = RWKV_ERROR_NONE;
 
     std::unique_ptr<struct rwkv_context> ctx(new(std::nothrow) struct rwkv_context());
     RWKV_ASSERT_NULL_MSG(RWKV_ERROR_CTX | RWKV_ERROR_ALLOC, ctx, "Failed to allocate rwkv_context");
+    ctx->print_errors = true;
 
     ctx->model = new(std::nothrow) struct rwkv_model();
     ctx->model->reference_count++;
+    // Native grouped-U8 custom nodes are CPU-only.  Keep the option disabled
+    // when a caller asks for accelerator offload so the existing GGML graph
+    // remains the safe path for CUDA/Metal/BLAS builds.
+    ctx->model->native_u8_enabled = native_u8 && n_gpu_layers == 0;
+    ctx->model->native_u8_packed_only =
+        ctx->model->native_u8_enabled && native_u8_packed_only;
+    ctx->model->layer_streaming = layer_streaming && n_gpu_layers == 0;
 
     ctx->n_threads = n_threads;
 
@@ -112,11 +129,45 @@ struct rwkv_context * rwkv_init_from_file(const char * file_path, const uint32_t
         ngl = 0;
     }
 
-    RWKV_ENSURE_OR_NULL(rwkv_load_model_from_file(file_path, *ctx->model, ngl));
+    RWKV_ENSURE_OR_NULL(
+        rwkv_load_model_from_file(file_path, *ctx->model, ngl, ctx->model->layer_streaming)
+    );
 
-    RWKV_ENSURE_OR_NULL(rwkv_measure_and_build_serial_context(*ctx->model, ctx->serial_graph));
+    rwkv_native_u8_prepare_model(*ctx->model);
+
+    if (!ctx->model->layer_streaming) {
+        RWKV_ENSURE_OR_NULL(rwkv_measure_and_build_serial_context(*ctx->model, ctx->serial_graph));
+    } else {
+        RWKV_ENSURE_OR_NULL(rwkv_layer_plans_create(*ctx));
+    }
 
     return ctx.release();
+}
+
+// API function.
+struct rwkv_context * rwkv_init_from_file(const char * file_path, const uint32_t n_threads, const uint32_t n_gpu_layers) {
+    return rwkv_init_from_file_impl(
+        file_path, n_threads, n_gpu_layers, false, false, false
+    );
+}
+
+// API function.  ``flags & 1`` enables the CPU-native grouped-U8 graph;
+// ``flags & 2`` additionally omits dense matrix payloads and requires packed
+// records to be uploaded before evaluation.
+struct rwkv_context * rwkv_init_from_file_ex(
+    const char * file_path,
+    const uint32_t n_threads,
+    const uint32_t n_gpu_layers,
+    const uint32_t flags
+) {
+    return rwkv_init_from_file_impl(
+        file_path,
+        n_threads,
+        n_gpu_layers,
+        (flags & 1u) != 0u,
+        (flags & 2u) != 0u,
+        (flags & 4u) != 0u
+    );
 }
 
 // API function.
@@ -129,7 +180,11 @@ struct rwkv_context * rwkv_clone_context(struct rwkv_context * ctx, const uint32
 
     clone->n_threads = n_threads;
 
-    RWKV_ENSURE_OR_NULL(rwkv_measure_and_build_serial_context(*clone->model, clone->serial_graph));
+    if (!clone->model->layer_streaming) {
+        RWKV_ENSURE_OR_NULL(rwkv_measure_and_build_serial_context(*clone->model, clone->serial_graph));
+    } else {
+        RWKV_ENSURE_OR_NULL(rwkv_layer_plans_create(*clone));
+    }
 
     clone->last_used_sequence_length = 0;
 
@@ -167,6 +222,26 @@ size_t rwkv_get_n_layer(const struct rwkv_context * ctx) {
     return (size_t) ctx->model->header.n_layer;
 }
 
+// API function.  These metadata getters are additive and intentionally keep
+// the existing state/eval buffers opaque to callers.
+uint32_t rwkv_get_arch_version_major(const struct rwkv_context * ctx) {
+    return ctx == nullptr || ctx->model == nullptr
+        ? 0u
+        : ctx->model->arch_version_major;
+}
+
+int64_t rwkv_get_head_count(const struct rwkv_context * ctx) {
+    return ctx == nullptr || ctx->model == nullptr
+        ? 0
+        : ctx->model->head_count;
+}
+
+int64_t rwkv_get_head_size(const struct rwkv_context * ctx) {
+    return ctx == nullptr || ctx->model == nullptr
+        ? 0
+        : ctx->model->head_size;
+}
+
 // API function.
 size_t rwkv_get_state_len(const struct rwkv_context * ctx) {
     const struct rwkv_file_header & header = ctx->model->header;
@@ -188,6 +263,12 @@ void rwkv_free(struct rwkv_context * ctx) {
     if (ctx == NULL) {
         return;
     }
+
+    // Layer plans use the model's CPU backend and must be destroyed before
+    // the last context releases that backend.
+    ctx->active_layer_plan = nullptr;
+    ctx->layer_plan_zero.reset();
+    ctx->layer_plan_rest.reset();
 
     if (--ctx->model->reference_count == 0) {
         for (auto buffer : ctx->model->buffers_w) {
@@ -249,11 +330,28 @@ size_t rwkv_get_tensor_nbytes(
     if (ctx == nullptr || name == nullptr) {
         return 0;
     }
+
     auto it = ctx->model->tensors.find(name);
     if (it == ctx->model->tensors.end()) {
         return 0;
     }
     return ggml_nbytes(it->second);
+}
+
+// API function.
+int32_t rwkv_get_tensor_type(
+    const struct rwkv_context * ctx,
+    const char * name
+) {
+    if (ctx == nullptr || name == nullptr) {
+        return -1;
+    }
+
+    auto it = ctx->model->tensors.find(name);
+    if (it == ctx->model->tensors.end()) {
+        return -1;
+    }
+    return static_cast<int32_t>(it->second->type);
 }
 
 bool rwkv_register_tensor_slot(
@@ -292,6 +390,30 @@ bool rwkv_set_tensor_from_slot(
     RWKV_ASSERT_FALSE_MSG(RWKV_ERROR_DATA, ggml_nbytes(tensor) == nbytes, "Tensor slot byte count mismatch");
     ggml_backend_tensor_set(tensor, slot.data + offset, 0, nbytes);
     slot.generation = generation;
+    return true;
+}
+
+// API function.
+bool rwkv_set_tensor_scale_u8_grouped(
+    struct rwkv_context * ctx,
+    const char * name,
+    const void * data,
+    const size_t nbytes
+) {
+    RWKV_ASSERT_FALSE_MSG(RWKV_ERROR_ARGS, ctx != nullptr, "Context is null");
+    RWKV_ASSERT_FALSE_MSG(RWKV_ERROR_ARGS, name != nullptr, "Tensor name is null");
+    RWKV_ASSERT_FALSE_MSG(RWKV_ERROR_ARGS, data != nullptr, "Tensor data is null");
+    RWKV_ASSERT_FALSE_MSG(
+        RWKV_ERROR_UNSUPPORTED,
+        ctx->model->native_u8_enabled,
+        "Native grouped-U8 is not enabled for this context"
+    );
+    RWKV_ASSERT_FALSE_MSG(
+        RWKV_ERROR_DATA,
+        rwkv_native_u8_store_tensor(*ctx->model, name, data, nbytes),
+        "Invalid grouped-U8 blob for tensor %s",
+        name
+    );
     return true;
 }
 

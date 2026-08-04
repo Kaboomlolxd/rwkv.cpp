@@ -90,6 +90,19 @@ extern "C" {
     // - n_gpu_layer: count of layers need to load to gpu
     RWKV_API struct rwkv_context * rwkv_init_from_file(const char * model_file_path, const uint32_t n_threads, const uint32_t n_gpu_layers);
 
+    // Extended loader.  flags & 1 enables the CPU-native grouped-U8 graph;
+    // flags & 2 enables packed-only residency, omitting dense matrix payloads
+    // and requiring grouped-U8 uploads before evaluation.  flags & 4 enables
+    // the native layer-local plan: block payloads and the full resident graph
+    // are omitted, and callers must use rwkv_layer_* below.  The legacy loader
+    // above always keeps all options disabled for ABI compatibility.
+    RWKV_API struct rwkv_context * rwkv_init_from_file_ex(
+        const char * model_file_path,
+        const uint32_t n_threads,
+        const uint32_t n_gpu_layers,
+        const uint32_t flags
+    );
+
     // Creates a new context from an existing one.
     // This can allow you to run multiple rwkv_eval's in parallel, without having to load a single model multiple times.
     // Each rwkv_context can have one eval running at a time.
@@ -186,6 +199,13 @@ extern "C" {
     // Useful for always offloading the entire model to GPU.
     RWKV_API size_t rwkv_get_n_layer(const struct rwkv_context * ctx);
 
+    // RWKV-7 parity diagnostics use these dimensions to map rwkv.cpp's flat
+    // per-layer state into the ChatRWKV semantic field order.  They are
+    // metadata-only getters and do not change the evaluation ABI.
+    RWKV_API uint32_t rwkv_get_arch_version_major(const struct rwkv_context * ctx);
+    RWKV_API int64_t rwkv_get_head_count(const struct rwkv_context * ctx);
+    RWKV_API int64_t rwkv_get_head_size(const struct rwkv_context * ctx);
+
     // Returns the number of float elements in a complete state for the given model.
     // This is the number of elements you'll need to allocate for a call to rwkv_eval, rwkv_eval_sequence, or rwkv_init_state.
     RWKV_API size_t rwkv_get_state_len(const struct rwkv_context * ctx);
@@ -193,6 +213,14 @@ extern "C" {
     // Returns the number of float elements in the logits output of a given model.
     // This is currently always identical to n_vocab.
     RWKV_API size_t rwkv_get_logits_len(const struct rwkv_context * ctx);
+
+    // True when the context was created with the layer-local ABI (flags & 4).
+    RWKV_API bool rwkv_supports_layer_streaming(const struct rwkv_context * ctx);
+
+    // Number of FP32 recurrent-state elements owned by one layer.  The
+    // layer-local API carries one layer state at a time instead of the full
+    // model state buffer.
+    RWKV_API size_t rwkv_get_layer_state_len(const struct rwkv_context * ctx);
 
     // Initializes the given state so that passing it to rwkv_eval or rwkv_eval_sequence would be identical to passing NULL.
     // Useful in cases where tracking the first call to these functions may be annoying or expensive.
@@ -223,6 +251,15 @@ extern "C" {
         const char * name
     );
 
+    // Returns the numeric ggml_type value for a named tensor, or -1 when the
+    // context/name/tensor is invalid.  The values intentionally mirror the
+    // public ggml enum (F32=0, F16=1, BF16=30) so callers can convert dense
+    // provider tensors numerically instead of guessing from byte size.
+    RWKV_API int32_t rwkv_get_tensor_type(
+        const struct rwkv_context * ctx,
+        const char * name
+    );
+
     RWKV_API bool rwkv_register_tensor_slot(
         struct rwkv_context * ctx,
         const uint32_t slot_id,
@@ -237,6 +274,192 @@ extern "C" {
         const size_t offset,
         const size_t nbytes,
         const uint64_t generation
+    );
+
+    // Upload an SG8\x01 grouped affine UINT8 tensor.  CPU-native grouped-U8
+    // matrix nodes retain the packed record in rwkv.cpp; small elementwise
+    // 2-D tensors are decoded into their existing GGML storage.  The blob is
+    // copied synchronously, so the caller may release its staging buffer on
+    // return.  Returns false for unknown names, malformed records, or shape
+    // mismatches.
+    RWKV_API bool rwkv_set_tensor_scale_u8_grouped(
+        struct rwkv_context * ctx,
+        const char * name,
+        const void * data,
+        const size_t nbytes
+    );
+
+    // Layer-local upload ABI.  These calls target the reusable single-block
+    // plan and never copy into the resident full-model graph.  The active
+    // plan is selected by rwkv_layer_step's layer_id; uploads may arrive
+    // before the first step and are retained only for the current layer.
+    RWKV_API bool rwkv_layer_set_tensor(
+        struct rwkv_context * ctx,
+        const char * name,
+        const void * data,
+        const size_t nbytes
+    );
+
+    // Layer-local dense upload variants.  The active one-block plan borrows
+    // the caller-owned FP16/BF16/FP32 payload instead of copying it into the
+    // plan's weight arena.  The non-persistent form is valid until the next
+    // rwkv_layer_begin call.  The persistent form retains only the pointer
+    // metadata and is valid until the caller invalidates the layer or frees
+    // the backing object.  These APIs never make a full-model native copy.
+    RWKV_API bool rwkv_layer_set_tensor_borrowed(
+        struct rwkv_context * ctx,
+        const char * name,
+        const void * data,
+        const size_t nbytes
+    );
+
+    RWKV_API bool rwkv_layer_set_tensor_borrowed_persistent(
+        struct rwkv_context * ctx,
+        const char * name,
+        const void * data,
+        const size_t nbytes
+    );
+
+    RWKV_API bool rwkv_layer_begin(
+        struct rwkv_context * ctx,
+        const uint32_t layer_id
+    );
+
+    // True after rwkv_layer_begin when every tensor for the selected layer
+    // was restored from the bounded native cache.  This lets a provider skip
+    // decoding and materializing a layer that the active plan already holds.
+    RWKV_API bool rwkv_layer_is_ready(
+        const struct rwkv_context * ctx,
+        const uint32_t layer_id
+    );
+
+    // Drop non-owning dense/grouped-U8 records for a provider layer that has
+    // been evicted.  This is required before the provider releases its
+    // backing view; the native cache deliberately does not own that memory.
+    RWKV_API bool rwkv_layer_invalidate_borrowed_cache(
+        struct rwkv_context * ctx,
+        const uint32_t layer_id
+    );
+
+    // Run one autoregressive token through all model blocks whose decoded
+    // payloads are already in the bounded native cache.  State buffers are
+    // full-model contiguous arrays with n_layer * rwkv_get_layer_state_len()
+    // elements; activation buffers contain n_embed elements.  This is an
+    // additive fast path and returns false when the cache is incomplete.
+    RWKV_API bool rwkv_layer_step_cached(
+        struct rwkv_context * ctx,
+        const float * activation_in,
+        float * activation_out,
+        const float * state_in,
+        float * state_out,
+        const float * v_first_in,
+        float * v_first_out
+    );
+
+    RWKV_API bool rwkv_layer_cache_ready(
+        const struct rwkv_context * ctx
+    );
+
+    RWKV_API bool rwkv_layer_set_tensor_scale_u8_grouped(
+        struct rwkv_context * ctx,
+        const char * name,
+        const void * data,
+        const size_t nbytes
+    );
+
+    // Layer-local variant that borrows the packed record until the next
+    // rwkv_layer_begin call.  This is an opt-in throughput ABI; callers must
+    // keep the source buffer alive for that interval.
+    RWKV_API bool rwkv_layer_set_tensor_scale_u8_grouped_borrowed(
+        struct rwkv_context * ctx,
+        const char * name,
+        const void * data,
+        const size_t nbytes
+    );
+
+    // Layer-local variant for provider-owned buffers whose lifetime covers
+    // the context.  This enables bounded metadata reuse without copying the
+    // packed weight payload into native storage.
+    RWKV_API bool rwkv_layer_set_tensor_scale_u8_grouped_borrowed_persistent(
+        struct rwkv_context * ctx,
+        const char * name,
+        const void * data,
+        const size_t nbytes
+    );
+
+    // Batch form of the layer-local grouped-U8 upload.  Names and buffers
+    // remain caller-owned; the call consumes them synchronously and applies
+    // the same validation as the scalar ABI for every record.
+    RWKV_API bool rwkv_layer_set_tensor_scale_u8_grouped_batch(
+        struct rwkv_context * ctx,
+        const char * const * names,
+        const void * const * data,
+        const size_t * nbytes,
+        const size_t count,
+        const bool persistent
+    );
+
+    // Evaluate one RWKV block.  activation/state buffers are FP32 and have
+    // lengths rwkv_get_n_embed() and rwkv_get_layer_state_len().  For RWKV-7,
+    // v_first_in/out are also n_embed elements; pass NULL for the first block
+    // input and use v_first_out for subsequent blocks.  A plan retains only
+    // the active layer payload plus graph/activation storage.
+    RWKV_API bool rwkv_layer_step(
+        struct rwkv_context * ctx,
+        const uint32_t layer_id,
+        const float * activation_in,
+        float * activation_out,
+        const float * state_in,
+        float * state_out,
+        const float * v_first_in,
+        float * v_first_out
+    );
+
+    // Evaluate a contiguous row-major activation sequence through one block
+    // while retaining the active layer payload.  The activation buffers have
+    // n_tokens * rwkv_get_n_embed() FP32 elements; state_in/state_out each
+    // have rwkv_get_layer_state_len() elements.  For RWKV-7, v_first buffers
+    // use the same row-major sequence shape.  This keeps prompt prefill on a
+    // single upload/eviction cycle without making the layer plan resident.
+    RWKV_API bool rwkv_layer_step_sequence(
+        struct rwkv_context * ctx,
+        const uint32_t layer_id,
+        const float * activation_in,
+        float * activation_out,
+        const size_t n_tokens,
+        const float * state_in,
+        float * state_out,
+        const float * v_first_in,
+        float * v_first_out
+    );
+
+    // Configure an optional bounded cache of decoded dense layer payloads.
+    // A zero limit disables and clears the cache. The cache is owned by this
+    // context and is separate from the active single-layer GGML arena; it
+    // never creates a full resident model graph.
+    RWKV_API bool rwkv_set_layer_cache_bytes(
+        struct rwkv_context * ctx,
+        const size_t bytes
+    );
+
+    RWKV_API size_t rwkv_get_layer_cache_bytes(
+        const struct rwkv_context * ctx
+    );
+
+    RWKV_API size_t rwkv_get_layer_cache_used_bytes(
+        const struct rwkv_context * ctx
+    );
+
+    RWKV_API uint64_t rwkv_get_layer_cache_hits(
+        const struct rwkv_context * ctx
+    );
+
+    RWKV_API uint64_t rwkv_get_layer_cache_misses(
+        const struct rwkv_context * ctx
+    );
+
+    RWKV_API uint64_t rwkv_get_layer_cache_evictions(
+        const struct rwkv_context * ctx
     );
 
     // Quantizes FP32 or FP16 model to one of quantized formats.

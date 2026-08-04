@@ -12,6 +12,23 @@ This project supports RWKV [v4](https://huggingface.co/BlinkDL/rwkv-4-pile-14b),
 
 Loading LoRA checkpoints in [Blealtan's format](https://github.com/Blealtan/RWKV-LM-LoRA) is supported through [merge_lora_into_ggml.py script](rwkv%2Fmerge_lora_into_ggml.py).
 
+## SSD engine grouped-U8 extension
+
+This vendored build also exposes a CPU-only grouped affine UINT8 path for the
+SSD engine. The `SG8\x01` record format is `magic + group_size + float32
+min/max pairs + UINT8 payload`, matching `scale_u8_grouped` in the parent
+repository. `rwkv_init_from_file_ex(..., flags)` enables the path with flag 1;
+flag 2 adds packed-only residency, where large matrix tensors keep their GGML
+shape but receive packed records through
+`rwkv_set_tensor_scale_u8_grouped` before evaluation. The Python wrapper uses
+the same ABI when the parent engine selects native grouped-U8 automatically.
+
+The implementation is deliberately CPU-only. It includes direct grouped-U8
+GEMV, an AVX2 block-of-eight kernel for RWKV-7 transposed `w/a/v/g` adapters,
+native embedding lookup, exact-length/finite-metadata validation, and a clear
+missing-upload error. CUDA, Metal, and other accelerator paths continue to use
+the ordinary GGML graph.
+
 <!-- TODO: Update data below -->
 
 ## Quality and performance
