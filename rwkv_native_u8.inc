@@ -20,6 +20,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <new>
 
 #if defined(__AVX2__) || defined(_M_AVX2)
 #    include <immintrin.h>
@@ -325,6 +326,79 @@ static inline float rwkv_native_u8_hsum256(__m256 value) {
 }
 #endif
 
+// Aligned rows reuse the same activation groups. Match the direct kernel's
+// reduction order, but compute each sum once per worker/vector instead of
+// once per output row. No matrix weights are decoded or retained here.
+static void rwkv_native_u8_activation_sums(
+    const float * x,
+    const size_t group_size,
+    const size_t groups,
+    float * sums
+) {
+    for (size_t group = 0; group < groups; ++group) {
+        const float * input = x + group * group_size;
+        float sum = 0.0f;
+        size_t j = 0;
+#if RWKV_NATIVE_U8_AVX2
+        if ((group_size & 7u) == 0u) {
+            __m256 accum = _mm256_setzero_ps();
+            for (; j + 8u <= group_size; j += 8u) {
+                accum = _mm256_add_ps(accum, _mm256_loadu_ps(input + j));
+            }
+            sum = rwkv_native_u8_hsum256(accum);
+        }
+#endif
+        for (; j < group_size; ++j) {
+            sum += input[j];
+        }
+        sums[group] = sum;
+    }
+}
+
+static float rwkv_native_u8_dot_aligned(
+    const rwkv_u8_grouped_matrix & matrix,
+    const float * x,
+    const float * sums,
+    const size_t groups_per_row,
+    const size_t row
+) {
+    const size_t group_size = static_cast<size_t>(matrix.group_size);
+    const size_t first_group = row * groups_per_row;
+    const uint8_t * quant = rwkv_native_u8_quant(matrix) + first_group * group_size;
+    const float * minima = matrix.group_min_data() + first_group;
+    const float * ranges = matrix.group_scale_data() + first_group;
+    const float inv_255 = 1.0f / 255.0f;
+    float acc = 0.0f;
+    for (size_t group = 0; group < groups_per_row; ++group) {
+        const size_t col = group * group_size;
+        float sum_qx = 0.0f;
+        size_t j = 0;
+#if RWKV_NATIVE_U8_AVX2
+        if ((group_size & 7u) == 0u) {
+            __m256 accum = _mm256_setzero_ps();
+            for (; j + 8u <= group_size; j += 8u) {
+                const __m256 vx = _mm256_loadu_ps(x + col + j);
+                const __m128i q8 = _mm_loadl_epi64(
+                    reinterpret_cast<const __m128i *>(quant + col + j)
+                );
+                const __m256 vq = _mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(q8));
+#if defined(__FMA__) || defined(_M_FMA)
+                accum = _mm256_fmadd_ps(vq, vx, accum);
+#else
+                accum = _mm256_add_ps(accum, _mm256_mul_ps(vq, vx));
+#endif
+            }
+            sum_qx = rwkv_native_u8_hsum256(accum);
+        }
+#endif
+        for (; j < group_size; ++j) {
+            sum_qx += static_cast<float>(quant[col + j]) * x[col + j];
+        }
+        acc += minima[group] * sums[group] + ranges[group] * inv_255 * sum_qx;
+    }
+    return acc;
+}
+
 static float rwkv_native_u8_dot_direct(
     const rwkv_u8_grouped_matrix & matrix,
     const float * x,
@@ -512,6 +586,30 @@ static void rwkv_native_u8_matmul_op(
     if (convert_input) {
         scratch.resize(static_cast<size_t>(in_features));
     }
+    // g32/g64 groups for the usual RWKV widths fit in 2 KiB of stack
+    // scratch, avoiding a new heap allocation on every native GEMV task.
+    float local_group_sums[512];
+    std::vector<float> large_group_sums;
+    float * group_sums = nullptr;
+    size_t groups_per_row = 0u;
+    const bool aligned_groups = matrix.blob_valid && !matrix.transpose &&
+        matrix.group_size != 0u && in_features > 0 &&
+        static_cast<size_t>(in_features) % matrix.group_size == 0u &&
+        out_features > nth;
+    if (aligned_groups) {
+        groups_per_row = static_cast<size_t>(in_features) / matrix.group_size;
+        if (groups_per_row <= sizeof(local_group_sums) / sizeof(local_group_sums[0])) {
+            group_sums = local_group_sums;
+        } else {
+            try {
+                large_group_sums.resize(groups_per_row);
+                group_sums = large_group_sums.data();
+            } catch (const std::bad_alloc &) {
+                // Sum reuse is optional. Preserve the direct computation if
+                // the scratch allocation cannot be satisfied.
+            }
+        }
+    }
 
     // Work is distributed over output rows (or eight-row blocks for the
     // transposed adapter maps), while one activation conversion is reused by
@@ -569,6 +667,25 @@ static void rwkv_native_u8_matmul_op(
                         );
                     }
                 }
+            }
+            continue;
+        }
+
+        if (group_sums != nullptr) {
+            rwkv_native_u8_activation_sums(
+                input_f32, matrix.group_size, groups_per_row, group_sums
+            );
+            // Each worker streams a contiguous weight range rather than
+            // visiting every nth row of a large mmap-backed matrix.
+            const size_t rows = static_cast<size_t>(out_features);
+            const size_t rows_per_task = (rows + static_cast<size_t>(nth) - 1u) /
+                static_cast<size_t>(nth);
+            const size_t row_begin = std::min(rows, static_cast<size_t>(ith) * rows_per_task);
+            const size_t row_end = std::min(rows, row_begin + rows_per_task);
+            for (size_t row = row_begin; row < row_end; ++row) {
+                output[row] = rwkv_native_u8_dot_aligned(
+                    matrix, input_f32, group_sums, groups_per_row, row
+                );
             }
             continue;
         }
